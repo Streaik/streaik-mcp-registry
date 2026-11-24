@@ -1,0 +1,24 @@
+bin/
+obj/
+.vs/
+
+# User-specific files
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.Development.json
+*.Fakton.*
+*.dev.*
+.clinerules
+*node_modules*
+.env
+.env.*
+!.env.example
+dist/
+**/dist/
+**/public/bundle*.*
+**/fakton/
+**/Docs/
+scripts/
+!samples/Streaik.Mcp.Regitry.Sample/appsettings.Production.json
