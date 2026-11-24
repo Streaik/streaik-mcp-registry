@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -10,7 +10,9 @@ import test, { after, before } from 'node:test';
 const sample = new URL('../samples/Streaik.Mcp.Registry.Sample/', import.meta.url);
 const setting = 'McpRegistry__DefaultServersBaseUrl';
 const entraSetting = 'McpRegistry__EntraServersBaseUrl';
-const catalog = JSON.parse(await readFile(new URL('../../streaik-mcp-catalog/catalog.json', import.meta.url), 'utf8'));
+const catalog = new URL('../../streaik-mcp-catalog/servers/', import.meta.url);
+const entries = await Promise.all((await readdir(catalog)).map(async file => JSON.parse(await readFile(new URL(file, catalog), 'utf8'))));
+const documents = entries.map(item => item.server);
 let outputDirectory;
 let listenArgs;
 
@@ -54,14 +56,17 @@ for (const byok of ['', 'https://mcp.example.test/byok']) {
     const response = await fetch(`${origin}/v0.1/servers`);
     assert.equal(response.status, 200);
     const listing = await response.json();
-    assert.equal(listing.metadata.count, 3);
-    for (const { server } of listing.servers) {
-      const original = catalog.servers.find(item => item.name === server.name).remotes[0];
+    assert.equal(listing.metadata.count, 6);
+    assert.equal(listing.servers.length, 6);
+    for (const { server, _meta } of listing.servers) {
+      const source = entries.find(item => item.server.name === server.name);
+      const original = source.server.remotes[0];
       const route = new URL(original.url).pathname;
-      assert.deepEqual(server.remotes, [
-        ...(byok ? [{ ...original, url: byok + route }] : []),
+      assert.deepEqual(server, { ...source.server, remotes: [
+        ...(byok && !source.obo ? [{ ...original, url: byok + route }] : []),
         { type: 'streamable-http', url: entra + route },
-      ]);
+      ] });
+      assert.equal(_meta, null);
     }
   });
 }
@@ -73,7 +78,7 @@ for (const configured of ['http://localhost:5087', 'https://mcp.example.test:844
     assert.equal(response.status, 200);
     assert.match(response.headers.get('content-type'), /^application\/json\b/);
     const servers = ['Anthropic-Skills', 'Google-Images', 'OpenAI-Images'].map(name => {
-      const server = structuredClone(catalog.servers.find(s => s.name === `io.github.streaik/${name}`));
+      const server = structuredClone(documents.find(s => s.name === `io.github.streaik/${name}`));
       for (const remote of server.remotes) remote.url = configured.replace(/\/$/, '') + new URL(remote.url).pathname;
       return { server, _meta: null };
     });
@@ -81,12 +86,12 @@ for (const configured of ['http://localhost:5087', 'https://mcp.example.test:844
   });
 }
 
-test('serves an empty list when disabled and exposes no alternative discovery routes', async t => {
+test('serves empty lists when disabled', async t => {
   const origin = await startRegistry(t);
   const response = await fetch(`${origin}/v0.1/servers`);
   assert.equal(response.status, 200);
   assert.deepEqual(await response.json(), { servers: [], metadata: { count: 0 } });
-  for (const path of ['/v1/servers', '/catalog.json', '/openai-images']) {
+  for (const path of ['/v1/servers', '/v0.1/entra/servers', '/catalog.json', '/openai-images']) {
     assert.equal((await fetch(`${origin}${path}`)).status, 404);
   }
   assert.equal((await fetch(`${origin}/v0.1/servers`, { method: 'POST' })).status, 405);

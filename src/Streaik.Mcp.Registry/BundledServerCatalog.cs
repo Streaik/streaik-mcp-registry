@@ -7,6 +7,7 @@ internal static class BundledServerCatalog
     internal const string BaseUrlSetting = "McpRegistry:DefaultServersBaseUrl";
     internal const string EntraBaseUrlSetting = "McpRegistry:EntraServersBaseUrl";
     private const string DefaultOrigin = "https://default-mcp-host.invalid";
+    private const string ResourcePrefix = "Streaik.Mcp.Catalog.";
 
     internal static string CreateResponse(string? configuredUrl, string? configuredEntraUrl)
     {
@@ -17,26 +18,32 @@ internal static class BundledServerCatalog
             throw new InvalidOperationException($"{BaseUrlSetting} and {EntraBaseUrlSetting} must not publish the same transport URLs.");
         if (baseUrl is not null || entraUrl is not null)
         {
-            using var stream = typeof(BundledServerCatalog).Assembly.GetManifestResourceStream("Streaik.Mcp.Catalog.json")
-                ?? throw new InvalidOperationException("The bundled MCP catalog is missing.");
-            var servers = JsonNode.Parse(stream)?["servers"]?.AsArray()
-                ?? throw new InvalidOperationException("The bundled MCP catalog must contain a servers array.");
+            var assembly = typeof(BundledServerCatalog).Assembly;
+            var files = assembly.GetManifestResourceNames().Where(name => name.StartsWith(ResourcePrefix, StringComparison.Ordinal) && name.EndsWith(".json", StringComparison.Ordinal)).ToArray();
+            if (files.Length == 0) throw new InvalidOperationException("The bundled MCP catalog is missing.");
 
-            foreach (var document in servers.OrderBy(server => server?["name"]?.GetValue<string>(), StringComparer.Ordinal))
+            var entries = files.Select(file =>
             {
-                var server = document?.DeepClone() ?? throw new InvalidOperationException("The bundled MCP catalog contains a null server.");
+                using var stream = assembly.GetManifestResourceStream(file)!;
+                var entry = JsonNode.Parse(stream)?.AsObject() ?? throw new InvalidOperationException("A bundled MCP catalog file is empty.");
+                return (Id: file[ResourcePrefix.Length..^5], Entry: entry);
+            }).OrderBy(item => item.Entry["server"]?["name"]?.GetValue<string>(), StringComparer.Ordinal);
+
+            foreach (var (id, entry) in entries)
+            {
+                var server = entry["server"]?.AsObject() ?? throw new InvalidOperationException("A bundled MCP catalog entry is missing its registry document.");
+                var delegated = entry.ContainsKey("obo");
                 var remotes = server["remotes"]?.AsArray()
                     ?? throw new InvalidOperationException("A bundled server is missing its remotes.");
                 var published = new JsonArray();
                 foreach (var remote in remotes)
                 {
                     var url = remote?["url"]?.GetValue<string>();
-                    if (url is null || !url.StartsWith(DefaultOrigin + "/", StringComparison.Ordinal) || url.Length == DefaultOrigin.Length + 1)
-                        throw new InvalidOperationException($"Bundled remotes must use {DefaultOrigin} and a route.");
+                    var path = "/" + id;
+                    if (url != DefaultOrigin + path)
+                        throw new InvalidOperationException($"The bundled MCP transport URL must match its catalog filename: '{id}'.");
 
-                    // Append rather than resolving a rooted URI, which would discard any deployment prefix.
-                    var path = url[DefaultOrigin.Length..];
-                    if (baseUrl is not null)
+                    if (baseUrl is not null && !delegated)
                     {
                         var byok = remote!.DeepClone();
                         byok["url"] = baseUrl + path;
@@ -51,16 +58,15 @@ internal static class BundledServerCatalog
                     }
                 }
 
-                server["remotes"] = published;
-                items.Add(new JsonObject { ["server"] = server, ["_meta"] = null });
+                if (published.Count > 0)
+                {
+                    server["remotes"] = published;
+                    items.Add(new JsonObject { ["server"] = server.DeepClone(), ["_meta"] = null });
+                }
             }
         }
 
-        return new JsonObject
-        {
-            ["servers"] = items,
-            ["metadata"] = new JsonObject { ["count"] = items.Count }
-        }.ToJsonString();
+        return new JsonObject { ["servers"] = items, ["metadata"] = new JsonObject { ["count"] = items.Count } }.ToJsonString();
     }
 
     private static string? ReadBaseUrl(string? value, string setting)

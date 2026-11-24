@@ -11,7 +11,8 @@ public static class RegistryHosting
     public static RouteHandlerBuilder MapStreaikMcpRegistry(this IEndpointRouteBuilder endpoints)
     {
         var configuration = endpoints.ServiceProvider.GetRequiredService<IConfiguration>();
-        var response = BundledServerCatalog.CreateResponse(configuration[BundledServerCatalog.BaseUrlSetting], configuration[BundledServerCatalog.EntraBaseUrlSetting]);
+        var response = BundledServerCatalog.CreateResponse(configuration[BundledServerCatalog.BaseUrlSetting],
+            configuration[BundledServerCatalog.EntraBaseUrlSetting]);
         return endpoints.MapGet("/v0.1/servers", () => Results.Text(response, "application/json"));
     }
 }
