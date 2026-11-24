@@ -1,26 +1,34 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
-import { readFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import test, { before } from 'node:test';
+import test, { after, before } from 'node:test';
 
 const sample = new URL('../samples/Streaik.Mcp.Registry.Sample/', import.meta.url);
-const dll = fileURLToPath(new URL('bin/Debug/net11.0/Streaik.Mcp.Registry.Sample.dll', sample));
 const setting = 'McpRegistry__DefaultServersBaseUrl';
+const entraSetting = 'McpRegistry__EntraServersBaseUrl';
 const catalog = JSON.parse(await readFile(new URL('../../streaik-mcp-catalog/catalog.json', import.meta.url), 'utf8'));
-const listenArgs = [dll, '--urls', 'http://127.0.0.1:0'];
+let outputDirectory;
+let listenArgs;
 
-before(() => {
-  const build = spawnSync('dotnet', ['build', '--configuration', 'Debug'], { cwd: sample, encoding: 'utf8', timeout: 120000 });
+before(async () => {
+  // Avoid overwriting DLLs held open by a running sample host on Windows.
+  outputDirectory = await mkdtemp(join(tmpdir(), 'streaik-mcp-registry-'));
+  listenArgs = [join(outputDirectory, 'Streaik.Mcp.Registry.Sample.dll'), '--urls', 'http://127.0.0.1:0'];
+  const build = spawnSync('dotnet', ['build', '--output', outputDirectory], { cwd: fileURLToPath(sample), encoding: 'utf8', timeout: 120000 });
   assert.ifError(build.error);
   assert.equal(build.status, 0, build.stdout + build.stderr);
 });
 
-async function startRegistry(t, baseUrl = '') {
+after(async () => { if (outputDirectory) await rm(outputDirectory, { recursive: true, force: true }); });
+
+async function startRegistry(t, baseUrl = '', entraUrl = '') {
   const child = spawn('dotnet', listenArgs, {
     cwd: sample,
-    env: { ...process.env, [setting]: baseUrl, Logging__LogLevel__Microsoft__Hosting__Lifetime: 'Information' },
+    env: { ...process.env, [setting]: baseUrl, [entraSetting]: entraUrl, Logging__LogLevel__Microsoft__Hosting__Lifetime: 'Information' },
   });
   const closed = once(child, 'close');
   t.after(async () => { child.kill(); await closed; });
@@ -36,6 +44,25 @@ async function startRegistry(t, baseUrl = '') {
     child.stdout.on('data', onData);
     child.stderr.on('data', onData);
     closed.then(([code]) => { clearTimeout(timer); reject(new Error(`Registry exited (${code}):\n${output}`)); }, reject);
+  });
+}
+
+for (const byok of ['', 'https://mcp.example.test/byok']) {
+  test(`publishes OAuth remotes without API-key headers ${byok ? 'alongside BYOK' : 'on their own'}`, async t => {
+    const entra = 'https://mcp.example.test/team/entra';
+    const origin = await startRegistry(t, byok, entra + '/');
+    const response = await fetch(`${origin}/v0.1/servers`);
+    assert.equal(response.status, 200);
+    const listing = await response.json();
+    assert.equal(listing.metadata.count, 3);
+    for (const { server } of listing.servers) {
+      const original = catalog.servers.find(item => item.name === server.name).remotes[0];
+      const route = new URL(original.url).pathname;
+      assert.deepEqual(server.remotes, [
+        ...(byok ? [{ ...original, url: byok + route }] : []),
+        { type: 'streamable-http', url: entra + route },
+      ]);
+    }
   });
 }
 
@@ -69,7 +96,7 @@ test('rejects invalid base URLs before listening', () => {
   for (const baseUrl of ['mcp.example.test', 'ftp://mcp.example.test', 'http://mcp.example.test',
     'https://user:pass@mcp.example.test', 'https://mcp.example.test/?query=1', 'https://mcp.example.test/#fragment']) {
     const result = spawnSync('dotnet', listenArgs, {
-      cwd: sample, env: { ...process.env, [setting]: baseUrl }, encoding: 'utf8', timeout: 5000,
+      cwd: sample, env: { ...process.env, [setting]: baseUrl, [entraSetting]: '' }, encoding: 'utf8', timeout: 5000,
     });
     assert.ifError(result.error);
     assert.ok(result.status !== null && result.status !== 0, baseUrl);
