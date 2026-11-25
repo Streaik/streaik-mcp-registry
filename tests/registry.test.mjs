@@ -56,8 +56,8 @@ for (const byok of ['', 'https://mcp.example.test/byok']) {
     const response = await fetch(`${origin}/v0.1/servers`);
     assert.equal(response.status, 200);
     const listing = await response.json();
-    assert.equal(listing.metadata.count, 6);
-    assert.equal(listing.servers.length, 6);
+    assert.equal(listing.metadata.count, 8);
+    assert.equal(listing.servers.length, 8);
     for (const { server, _meta } of listing.servers) {
       const source = entries.find(item => item.server.name === server.name);
       const original = source.server.remotes[0];
@@ -77,12 +77,12 @@ for (const configured of ['http://localhost:5087', 'https://mcp.example.test:844
     const response = await fetch(`${origin}/v0.1/servers`, { headers: { 'X-Forwarded-Host': 'different.example.test' } });
     assert.equal(response.status, 200);
     assert.match(response.headers.get('content-type'), /^application\/json\b/);
-    const servers = ['Anthropic-Skills', 'Google-Images', 'OpenAI-Images'].map(name => {
+    const servers = ['Anthropic-Skills', 'GitHub-RESTCountries', 'Google-Images', 'ModelContext-Utils', 'OpenAI-Images'].map(name => {
       const server = structuredClone(documents.find(s => s.name === `io.github.streaik/${name}`));
       for (const remote of server.remotes) remote.url = configured.replace(/\/$/, '') + new URL(remote.url).pathname;
       return { server, _meta: null };
     });
-    assert.deepEqual(await response.json(), { servers, metadata: { count: 3 } });
+    assert.deepEqual(await response.json(), { servers, metadata: { count: 5 } });
   });
 }
 
