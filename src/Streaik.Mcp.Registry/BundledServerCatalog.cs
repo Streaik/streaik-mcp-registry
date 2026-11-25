@@ -5,7 +5,7 @@ using System.Text.RegularExpressions;
 
 namespace Streaik.Mcp.Registry;
 
-internal static class BundledServerCatalog
+internal sealed class BundledServerCatalog
 {
     internal const string BaseUrlSetting = "McpRegistry:DefaultServersBaseUrl";
     internal const string EntraBaseUrlSetting = "McpRegistry:EntraServersBaseUrl";
@@ -14,17 +14,24 @@ internal static class BundledServerCatalog
     private const string EntraProtectedRemotes = "net.streaik/entra-protected-remotes";
 
     private sealed record RuntimeBase(string Url, string Host, int Port, string NamePrefix);
+    private readonly RuntimeBase? baseUrl;
+    private readonly RuntimeBase? entraUrl;
+    internal string? AccessMetadataUrl => entraUrl is null ? null : entraUrl.Url + "/.well-known/streaik-mcp-access";
 
-    internal static string CreateResponse(string? configuredUrl, string? configuredEntraUrl)
+    internal BundledServerCatalog(string? configuredUrl, string? configuredEntraUrl)
     {
-        var items = new JsonArray();
-        var baseUrl = ReadBaseUrl(configuredUrl, BaseUrlSetting);
-        var entraUrl = ReadBaseUrl(configuredEntraUrl, EntraBaseUrlSetting);
+        baseUrl = ReadBaseUrl(configuredUrl, BaseUrlSetting);
+        entraUrl = ReadBaseUrl(configuredEntraUrl, EntraBaseUrlSetting);
         if (baseUrl is not null && entraUrl is not null && string.Equals(baseUrl.Url, entraUrl.Url, StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException($"{BaseUrlSetting} and {EntraBaseUrlSetting} must not publish the same transport URLs.");
         if (baseUrl is not null && entraUrl is not null && baseUrl.NamePrefix == entraUrl.NamePrefix &&
             (baseUrl.Host != entraUrl.Host || baseUrl.Port != entraUrl.Port))
             throw new InvalidOperationException($"{BaseUrlSetting} and {EntraBaseUrlSetting} must not map different authorities to the same registry namespace.");
+    }
+
+    internal string CreateResponse(RuntimeAccess? access)
+    {
+        var items = new JsonArray();
         if (baseUrl is not null || entraUrl is not null)
         {
             var assembly = typeof(BundledServerCatalog).Assembly;
@@ -49,7 +56,10 @@ internal static class BundledServerCatalog
 
                 var remotes = server["remotes"]?.AsArray()
                     ?? throw new InvalidOperationException("A bundled server is missing its remotes.");
-                var delegated = entry.ContainsKey("obo");
+                var graphOnly = entry.ContainsKey("obo");
+                var provider = remotes.Any(remote => remote?["headers"] is JsonArray { Count: > 0 });
+                var mode = access?.ProviderModes?.GetValueOrDefault(id);
+                var advertiseEntra = graphOnly ? access?.GraphObo == true : !provider || mode is "delegated" or "headers";
                 var path = "/" + id;
                 foreach (var remote in remotes)
                 {
@@ -57,7 +67,7 @@ internal static class BundledServerCatalog
                         throw new InvalidOperationException($"The bundled MCP transport URL must match its catalog filename: '{id}'.");
                 }
 
-                (RuntimeBase? Base, bool Entra)[] runtimes = [(delegated ? null : baseUrl, false), (entraUrl, true)];
+                (RuntimeBase? Base, bool Entra)[] runtimes = [(graphOnly ? null : baseUrl, false), (advertiseEntra ? entraUrl : null, true)];
                 foreach (var group in runtimes.Where(runtime => runtime.Base is not null).GroupBy(runtime => runtime.Base!.NamePrefix))
                 {
                     var name = $"{group.Key}/{suffix}";
@@ -73,9 +83,9 @@ internal static class BundledServerCatalog
                             var url = runtime!.Url + path;
                             var transport = (JsonObject)remote!.DeepClone();
                             transport["url"] = url;
-                            if (entra)
+                            if (entra && (graphOnly || mode == "delegated"))
                             {
-                                if (delegated || transport["headers"] is JsonArray { Count: > 0 }) protectedUrls.Add(url);
+                                protectedUrls.Add(url);
                                 transport.Remove("headers"); // OAuth discovery stays on the runtime.
                             }
                             published.Add(transport);

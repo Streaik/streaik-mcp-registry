@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
+import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -18,6 +19,7 @@ const tenant = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
 const client = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const catalog = new URL('../../streaik-mcp-catalog/servers/', import.meta.url);
 const entries = await Promise.all((await readdir(catalog)).map(async file => JSON.parse(await readFile(new URL(file, catalog), 'utf8'))));
+const managed = { 'anthropic-skills': 'delegated', 'google-images': 'delegated', 'openai-images': 'delegated' };
 let outputDirectory;
 
 before(async () => {
@@ -42,9 +44,9 @@ function registryEnvironment(baseUrl = '', entraUrl = '', tenantId = tenant, cli
     Logging__LogLevel__Microsoft__Hosting__Lifetime: 'Information' };
 }
 
-async function startRegistry(t, kind, baseUrl, entraUrl) {
+async function startRegistry(t, kind, baseUrl, entraUrl, tenantId = tenant, clientId = client) {
   const { cwd, listenArgs } = samples[kind];
-  const env = kind === 'EntraAuth' ? registryEnvironment(baseUrl, entraUrl) : registryEnvironment(baseUrl, entraUrl, '', '');
+  const env = kind === 'EntraAuth' ? registryEnvironment(baseUrl, entraUrl, tenantId, clientId) : registryEnvironment(baseUrl, entraUrl, '', '');
   const child = spawn('dotnet', listenArgs, { cwd, env });
   const closed = once(child, 'close');
   t.after(async () => { child.kill(); await closed; });
@@ -63,20 +65,35 @@ async function startRegistry(t, kind, baseUrl, entraUrl) {
   });
 }
 
-function expectedDocuments(prefix, byok, entra) {
-  return entries.filter(({ obo }) => entra || byok && !obo).map(({ server, obo }) => {
+async function startRuntime(t, access = { providerModes: managed, graphObo: true }) {
+  const server = createServer((request, response) => {
+    if (request.url !== '/team/entra/.well-known/streaik-mcp-access' || !access) {
+      response.writeHead(404).end();
+      return;
+    }
+    response.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(access));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  return { origin: `http://127.0.0.1:${server.address().port}`, prefix: `127.0.0.1-${server.address().port}` };
+}
+
+function expectedDocuments(prefix, byok, entra, providerModes = managed, graphObo = true) {
+  return entries.flatMap(({ server, obo }) => {
     const [original] = server.remotes;
     const route = new URL(original.url).pathname;
     const name = `${prefix}/${server.name.split('/')[1]}`;
     const remotes = byok && !obo ? [{ ...original, url: byok + route }] : [];
     const expected = { ...server, name, remotes };
-    if (entra) {
+    const mode = providerModes[route.slice(1)];
+    if (entra && (obo ? graphObo : !original.headers?.length || mode)) {
       const { headers, ...remote } = original;
       const url = entra + route;
-      remotes.push({ ...remote, url });
-      if (obo || headers?.length) expected._meta = { [protectedRemotes]: [url] };
+      const protectedRemote = obo || mode === 'delegated';
+      remotes.push({ ...(protectedRemote ? remote : original), url });
+      if (protectedRemote) expected._meta = { [protectedRemotes]: [url] };
     }
-    return { server: expected, _meta: null };
+    return remotes.length ? [{ server: expected, _meta: null }] : [];
   });
 }
 
@@ -100,11 +117,12 @@ async function assertListing(origin, expected) {
 for (const kind of Object.keys(samples)) {
   test(`${kind} serves the same public discovery contract with both runtimes configured`, async t => {
     const byok = 'https://mcp.example.test/team/byok';
-    const entra = 'https://entra.example.test:8443/team/entra';
+    const runtime = await startRuntime(t);
+    const entra = runtime.origin + '/team/entra';
     const origin = await startRegistry(t, kind, byok + '/', entra + '/');
     await assertListing(origin, [
       ...expectedDocuments('test.example.mcp', byok),
-      ...expectedDocuments('test.example.entra-8443', '', entra),
+      ...expectedDocuments(runtime.prefix, '', entra),
     ]);
     for (const path of ['/v1/servers', '/v0.1/entra/servers', '/v0.1/servers/mcp', '/catalog.json', '/openai-images']) {
       assert.equal((await fetch(`${origin}${path}`)).status, 404, path);
@@ -121,16 +139,24 @@ for (const kind of Object.keys(samples)) {
 }
 
 test('groups transports on the same authority but keeps path prefixes', async t => {
-  const byok = 'https://mcp.example.test/byok';
-  const entra = 'https://mcp.example.test/team/entra';
+  const runtime = await startRuntime(t);
+  const byok = runtime.origin + '/byok';
+  const entra = runtime.origin + '/team/entra';
   const origin = await startRegistry(t, 'NoAuth', byok, entra);
-  await assertListing(origin, expectedDocuments('test.example.mcp', byok, entra));
+  await assertListing(origin, expectedDocuments(runtime.prefix, byok, entra));
 });
 
-test('can list only the Entra runtime, independently of registry authentication', async t => {
-  const entra = 'https://mcp.example.test/team/entra';
+test('reflects changes between header mode and OAuth, and does not guess when access metadata is unavailable', async t => {
+  const access = { providerModes: { ...managed, 'google-images': 'headers' }, graphObo: true };
+  const runtime = await startRuntime(t, access);
+  const entra = runtime.origin + '/team/entra';
   const origin = await startRegistry(t, 'NoAuth', '', entra);
-  await assertListing(origin, expectedDocuments('test.example.mcp', '', entra));
+  await assertListing(origin, expectedDocuments(runtime.prefix, '', entra, access.providerModes));
+  access.providerModes['google-images'] = 'delegated';
+  await assertListing(origin, expectedDocuments(runtime.prefix, '', entra));
+  const unavailable = runtime.origin + '/not-published';
+  const otherRegistry = await startRegistry(t, 'NoAuth', '', unavailable);
+  await assertListing(otherRegistry, expectedDocuments(runtime.prefix, '', unavailable, {}, false));
 });
 
 for (const [configured, prefix] of [
@@ -168,8 +194,9 @@ test('rejects duplicate transport URLs and names that collide across authorities
   assertStartupFailure('NoAuth', registryEnvironment('https://mcp.example.test:8443', 'https://mcp-8443.example.test'), /must not map different authorities/);
 });
 
-test('requires tenant and API application IDs only in the EntraAuth sample', () => {
-  for (const [tenantId, clientId] of [['', client], [tenant, 'not-a-guid'], [tenant, '00000000-0000-0000-0000-000000000000']]) {
-    assertStartupFailure('EntraAuth', registryEnvironment('', '', tenantId, clientId), /Set AzureAd:TenantId and AzureAd:ClientId/);
-  }
+test('EntraAuth registry discovery is public without Entra credentials; the runtime enforces OAuth', async t => {
+  const runtime = await startRuntime(t);
+  const entra = runtime.origin + '/team/entra';
+  const origin = await startRegistry(t, 'EntraAuth', '', entra, '', '');
+  await assertListing(origin, expectedDocuments(runtime.prefix, '', entra));
 });
