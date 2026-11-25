@@ -7,31 +7,45 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test, { after, before } from 'node:test';
 
-const sample = new URL('../samples/Streaik.Mcp.Registry.Sample/', import.meta.url);
+const samples = Object.fromEntries(['NoAuth', 'EntraAuth'].map(kind => {
+  const name = `Streaik.Mcp.Registry.${kind}`;
+  return [kind, { name, cwd: new URL(`../samples/${name}/`, import.meta.url) }];
+}));
 const setting = 'McpRegistry__DefaultServersBaseUrl';
 const entraSetting = 'McpRegistry__EntraServersBaseUrl';
+const protectedRemotes = 'net.streaik/entra-protected-remotes';
+const tenant = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
+const client = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const catalog = new URL('../../streaik-mcp-catalog/servers/', import.meta.url);
 const entries = await Promise.all((await readdir(catalog)).map(async file => JSON.parse(await readFile(new URL(file, catalog), 'utf8'))));
-const documents = entries.map(item => item.server);
 let outputDirectory;
-let listenArgs;
 
 before(async () => {
   // Avoid overwriting DLLs held open by a running sample host on Windows.
   outputDirectory = await mkdtemp(join(tmpdir(), 'streaik-mcp-registry-'));
-  listenArgs = [join(outputDirectory, 'Streaik.Mcp.Registry.Sample.dll'), '--urls', 'http://127.0.0.1:0'];
-  const build = spawnSync('dotnet', ['build', '--output', outputDirectory], { cwd: fileURLToPath(sample), encoding: 'utf8', timeout: 120000 });
-  assert.ifError(build.error);
-  assert.equal(build.status, 0, build.stdout + build.stderr);
+  for (const sample of Object.values(samples)) {
+    const output = join(outputDirectory, sample.name);
+    sample.listenArgs = [join(output, `${sample.name}.dll`), '--urls', 'http://127.0.0.1:0'];
+    const build = spawnSync('dotnet', ['build', '-c', 'Release', '--output', output], {
+      cwd: fileURLToPath(sample.cwd), encoding: 'utf8', timeout: 120000,
+    });
+    assert.ifError(build.error);
+    assert.equal(build.status, 0, build.stdout + build.stderr);
+  }
 });
 
 after(async () => { if (outputDirectory) await rm(outputDirectory, { recursive: true, force: true }); });
 
-async function startRegistry(t, baseUrl = '', entraUrl = '') {
-  const child = spawn('dotnet', listenArgs, {
-    cwd: sample,
-    env: { ...process.env, [setting]: baseUrl, [entraSetting]: entraUrl, Logging__LogLevel__Microsoft__Hosting__Lifetime: 'Information' },
-  });
+function registryEnvironment(baseUrl = '', entraUrl = '', tenantId = tenant, clientId = client) {
+  return { ...process.env, DOTNET_ENVIRONMENT: 'Testing', ASPNETCORE_ENVIRONMENT: 'Testing',
+    [setting]: baseUrl, [entraSetting]: entraUrl, AzureAd__TenantId: tenantId, AzureAd__ClientId: clientId,
+    Logging__LogLevel__Microsoft__Hosting__Lifetime: 'Information' };
+}
+
+async function startRegistry(t, kind, baseUrl, entraUrl) {
+  const { cwd, listenArgs } = samples[kind];
+  const env = kind === 'EntraAuth' ? registryEnvironment(baseUrl, entraUrl) : registryEnvironment(baseUrl, entraUrl, '', '');
+  const child = spawn('dotnet', listenArgs, { cwd, env });
   const closed = once(child, 'close');
   t.after(async () => { child.kill(); await closed; });
 
@@ -49,62 +63,113 @@ async function startRegistry(t, baseUrl = '', entraUrl = '') {
   });
 }
 
-for (const byok of ['', 'https://mcp.example.test/byok']) {
-  test(`publishes OAuth remotes without API-key headers ${byok ? 'alongside BYOK' : 'on their own'}`, async t => {
-    const entra = 'https://mcp.example.test/team/entra';
-    const origin = await startRegistry(t, byok, entra + '/');
-    const response = await fetch(`${origin}/v0.1/servers`);
-    assert.equal(response.status, 200);
-    const listing = await response.json();
-    assert.equal(listing.metadata.count, 8);
-    assert.equal(listing.servers.length, 8);
-    for (const { server, _meta } of listing.servers) {
-      const source = entries.find(item => item.server.name === server.name);
-      const original = source.server.remotes[0];
-      const route = new URL(original.url).pathname;
-      assert.deepEqual(server, { ...source.server, remotes: [
-        ...(byok && !source.obo ? [{ ...original, url: byok + route }] : []),
-        { type: 'streamable-http', url: entra + route },
-      ] });
-      assert.equal(_meta, null);
+function expectedDocuments(prefix, byok, entra) {
+  return entries.filter(({ obo }) => entra || byok && !obo).map(({ server, obo }) => {
+    const [original] = server.remotes;
+    const route = new URL(original.url).pathname;
+    const name = `${prefix}/${server.name.split('/')[1]}`;
+    const remotes = byok && !obo ? [{ ...original, url: byok + route }] : [];
+    const expected = { ...server, name, remotes };
+    if (entra) {
+      const { headers, ...remote } = original;
+      const url = entra + route;
+      remotes.push({ ...remote, url });
+      if (obo || headers?.length) expected._meta = { [protectedRemotes]: [url] };
+    }
+    return { server: expected, _meta: null };
+  });
+}
+
+async function assertListing(origin, expected) {
+  const response = await fetch(`${origin}/v0.1/servers`, { headers: {
+    Origin: 'https://web.example.test', Forwarded: 'host=registry.example.test', 'X-Forwarded-Host': 'other.example.test',
+  } });
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('access-control-allow-origin'), '*');
+  assert.match(response.headers.get('content-type'), /^application\/json\b/);
+  const listing = await response.json();
+  const byName = (a, b) => a.server.name.localeCompare(b.server.name);
+  assert.deepEqual(listing, { servers: listing.servers, metadata: { count: expected.length } });
+  assert.deepEqual(listing.servers.toSorted(byName), expected.toSorted(byName));
+  for (const { server } of listing.servers) {
+    assert.match(server.name, /^[a-zA-Z0-9.-]+\/[a-zA-Z0-9._-]+$/);
+    assert.ok(server.name.length <= 200);
+  }
+}
+
+for (const kind of Object.keys(samples)) {
+  test(`${kind} serves the same public discovery contract with both runtimes configured`, async t => {
+    const byok = 'https://mcp.example.test/team/byok';
+    const entra = 'https://entra.example.test:8443/team/entra';
+    const origin = await startRegistry(t, kind, byok + '/', entra + '/');
+    await assertListing(origin, [
+      ...expectedDocuments('test.example.mcp', byok),
+      ...expectedDocuments('test.example.entra-8443', '', entra),
+    ]);
+    for (const path of ['/v1/servers', '/v0.1/entra/servers', '/v0.1/servers/mcp', '/catalog.json', '/openai-images']) {
+      assert.equal((await fetch(`${origin}${path}`)).status, 404, path);
+    }
+    for (const method of ['POST', 'PUT', 'PATCH', 'DELETE']) {
+      assert.equal((await fetch(`${origin}/v0.1/servers`, { method })).status, 405, method);
     }
   });
-}
 
-for (const configured of ['http://localhost:5087', 'https://mcp.example.test:8443/team/tools/']) {
-  test(`serves AIHappey's list envelope with catalog remotes rebased to ${configured}`, async t => {
-    const origin = await startRegistry(t, configured);
-    const response = await fetch(`${origin}/v0.1/servers`, { headers: { 'X-Forwarded-Host': 'different.example.test' } });
-    assert.equal(response.status, 200);
-    assert.match(response.headers.get('content-type'), /^application\/json\b/);
-    const servers = ['Anthropic-Skills', 'GitHub-RESTCountries', 'Google-Images', 'ModelContext-Utils', 'OpenAI-Images'].map(name => {
-      const server = structuredClone(documents.find(s => s.name === `io.github.streaik/${name}`));
-      for (const remote of server.remotes) remote.url = configured.replace(/\/$/, '') + new URL(remote.url).pathname;
-      return { server, _meta: null };
-    });
-    assert.deepEqual(await response.json(), { servers, metadata: { count: 5 } });
+  test(`${kind} serves an empty list with no runtimes configured`, async t => {
+    const origin = await startRegistry(t, kind);
+    await assertListing(origin, []);
   });
 }
 
-test('serves empty lists when disabled', async t => {
-  const origin = await startRegistry(t);
-  const response = await fetch(`${origin}/v0.1/servers`);
-  assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), { servers: [], metadata: { count: 0 } });
-  for (const path of ['/v1/servers', '/v0.1/entra/servers', '/catalog.json', '/openai-images']) {
-    assert.equal((await fetch(`${origin}${path}`)).status, 404);
-  }
-  assert.equal((await fetch(`${origin}/v0.1/servers`, { method: 'POST' })).status, 405);
+test('groups transports on the same authority but keeps path prefixes', async t => {
+  const byok = 'https://mcp.example.test/byok';
+  const entra = 'https://mcp.example.test/team/entra';
+  const origin = await startRegistry(t, 'NoAuth', byok, entra);
+  await assertListing(origin, expectedDocuments('test.example.mcp', byok, entra));
 });
 
-test('rejects invalid base URLs before listening', () => {
+test('can list only the Entra runtime, independently of registry authentication', async t => {
+  const entra = 'https://mcp.example.test/team/entra';
+  const origin = await startRegistry(t, 'NoAuth', '', entra);
+  await assertListing(origin, expectedDocuments('test.example.mcp', '', entra));
+});
+
+for (const [configured, prefix] of [
+  ['http://localhost:5087', 'localhost-5087'],
+  ['http://127.0.0.1:5087', '127.0.0.1-5087'],
+  ['http://[::1]:5087', 'ipv6-00000000000000000000000000000001-5087'],
+  ['https://mcp.streaik.net:443/team/tools', 'net.streaik.mcp'],
+]) {
+  test(`uses a schema-compatible name for ${configured}`, async t => {
+    const origin = await startRegistry(t, 'NoAuth', configured + '/');
+    await assertListing(origin, expectedDocuments(prefix, configured.replace(':443', '')));
+  });
+}
+
+function assertStartupFailure(kind, env, message) {
+  const { cwd, listenArgs } = samples[kind];
+  const result = spawnSync('dotnet', listenArgs, {
+    cwd, env, encoding: 'utf8', timeout: 10000,
+  });
+  assert.ifError(result.error);
+  assert.notEqual(result.status, 0, result.stdout);
+  assert.match(result.stderr, message);
+}
+
+test('rejects invalid configured runtime URLs before listening', () => {
   for (const baseUrl of ['mcp.example.test', 'ftp://mcp.example.test', 'http://mcp.example.test',
     'https://user:pass@mcp.example.test', 'https://mcp.example.test/?query=1', 'https://mcp.example.test/#fragment']) {
-    const result = spawnSync('dotnet', listenArgs, {
-      cwd: sample, env: { ...process.env, [setting]: baseUrl, [entraSetting]: '' }, encoding: 'utf8', timeout: 5000,
-    });
-    assert.ifError(result.error);
-    assert.ok(result.status !== null && result.status !== 0, baseUrl);
-    assert.match(result.stderr, /McpRegistry:DefaultServersBaseUrl must be an absolute HTTPS URL/);
+    assertStartupFailure('NoAuth', registryEnvironment(baseUrl), /McpRegistry:DefaultServersBaseUrl must be an absolute HTTPS URL/);
+  }
+  assertStartupFailure('EntraAuth', registryEnvironment('', 'http://mcp.example.test'), /McpRegistry:EntraServersBaseUrl must be an absolute HTTPS URL/);
+});
+
+test('rejects duplicate transport URLs and names that collide across authorities', () => {
+  assertStartupFailure('NoAuth', registryEnvironment('https://mcp.example.test/mcp', 'https://mcp.example.test/mcp/'), /must not publish the same transport URLs/);
+  assertStartupFailure('NoAuth', registryEnvironment('https://mcp.example.test:8443', 'https://mcp-8443.example.test'), /must not map different authorities/);
+});
+
+test('requires tenant and API application IDs only in the EntraAuth sample', () => {
+  for (const [tenantId, clientId] of [['', client], [tenant, 'not-a-guid'], [tenant, '00000000-0000-0000-0000-000000000000']]) {
+    assertStartupFailure('EntraAuth', registryEnvironment('', '', tenantId, clientId), /Set AzureAd:TenantId and AzureAd:ClientId/);
   }
 });

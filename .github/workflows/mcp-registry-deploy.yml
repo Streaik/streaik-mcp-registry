@@ -31,19 +31,19 @@ jobs:
         with:
           dotnet-version: '11.0.x'
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
       - name: Test
         working-directory: streaik-mcp-registry
-        run: |
-          set -euo pipefail
-          find . -name '*.Tests.csproj' -print0 |
-            while IFS= read -r -d '' project; do
-              dotnet test "$project" -c Release
-            done
+        run: node --test
 
       - name: Publish registry
         working-directory: streaik-mcp-registry
         run: |
-          dotnet publish samples/Streaik.Mcp.Registry.Sample/Streaik.Mcp.Registry.Sample.csproj \
+          dotnet publish samples/Streaik.Mcp.Registry.NoAuth/Streaik.Mcp.Registry.NoAuth.csproj \
             -c Release \
             -r win-x64 \
             --self-contained true \
